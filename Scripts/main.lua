@@ -8,6 +8,10 @@ local DEFAULT_ATTACH_RETRY_DELAYS_MS = { 250, 500, 1000, 2000, 5000 }
 
 local mapVisible = Config.ShowMinimapAtStartup ~= false
 local largeMapOpen = false
+local minimapZoom = (Config.Minimap and Config.Minimap.Zoom) or 1.0
+local largeMapZoom = (Config.LargeMap and Config.LargeMap.Zoom) or 1.0
+local largeMapViewU = nil
+local largeMapViewV = nil
 local textureLoadAttempted = false
 local pixelLoadAttempted = false
 local arrowLoadAttempted = false
@@ -36,8 +40,15 @@ local fogGrid = {}
 local fogDirty = false
 local fogLastCellX = nil
 local fogLastCellY = nil
+local fogSaveDirty = false
+local fogFlushPending = false
+local fogSavePending = false
 local isFogEnabled
 local loadFogTexture
+local scheduleFogFlush
+local flushFogVisual
+local scheduleFogSave
+local flushFogSave
 
 local renderingLibrary = CreateInvalidObject()
 local widgetLayoutLibrary = CreateInvalidObject()
@@ -51,6 +62,8 @@ local overlay = {
     root = CreateInvalidObject(),
     canvas = CreateInvalidObject(),
     canvasSlot = nil,
+    viewport = CreateInvalidObject(),
+    viewportSlot = nil,
     dim = CreateInvalidObject(),
     dimSlot = nil,
     map = CreateInvalidObject(),
@@ -180,6 +193,8 @@ local function clearOverlayWidgetRefs(clearOwner)
 
     overlay.canvas = CreateInvalidObject()
     overlay.canvasSlot = nil
+    overlay.viewport = CreateInvalidObject()
+    overlay.viewportSlot = nil
     overlay.dim = CreateInvalidObject()
     overlay.dimSlot = nil
     overlay.map = CreateInvalidObject()
@@ -554,8 +569,13 @@ local function attachOverlay()
 
     overlay.dim, overlay.dimSlot = createImage(overlay.canvas, widgetOuter, 980, pixel, COLOR_BLACK)
     setSlotFill(overlay.dimSlot, 980)
-    overlay.map, overlay.mapSlot = createImage(overlay.canvas, widgetOuter, 990, map, COLOR_WHITE)
-    setSlotTopLeft(overlay.mapSlot, 990)
+    overlay.viewport = constructWidget("CanvasPanel", widgetOuter)
+    overlay.viewportSlot = overlay.viewport:IsValid() and addToCanvas(overlay.canvas, overlay.viewport) or nil
+    if overlay.viewportSlot then setSlotTopLeft(overlay.viewportSlot, 990) end
+    safeCall("Viewport ClipToBounds", function() overlay.viewport:SetClipping(1) end)
+    local mapParent = overlay.viewport:IsValid() and overlay.viewport or overlay.canvas
+    overlay.map, overlay.mapSlot = createImage(mapParent, widgetOuter, 0, map, COLOR_WHITE)
+    setSlotTopLeft(overlay.mapSlot, 0)
     overlay.mapTextureApplied = map:IsValid()
     overlay.borderTop, overlay.borderTopSlot = createImage(overlay.canvas, widgetOuter, 991, pixel, COLOR_BORDER)
     setSlotTopLeft(overlay.borderTopSlot, 991)
@@ -572,8 +592,9 @@ local function attachOverlay()
 
     if isFogEnabled() then
         local fogTex = loadFogTexture()
-        overlay.fog, overlay.fogSlot = createImage(overlay.canvas, widgetOuter, 995, fogTex, COLOR_WHITE)
-        setSlotTopLeft(overlay.fogSlot, 995)
+        local fogParent = overlay.viewport:IsValid() and overlay.viewport or overlay.canvas
+        overlay.fog, overlay.fogSlot = createImage(fogParent, widgetOuter, 1, fogTex, COLOR_WHITE)
+        setSlotTopLeft(overlay.fogSlot, 1)
         overlay.fogTextureApplied = fogTex:IsValid()
     end
 
@@ -932,9 +953,8 @@ local function updateFogAtPosition(worldX, worldY)
     end
 
     if changed then
-        fogDirty = true
-        writeFogTGA()
-        saveFogState()
+        fogSaveDirty = true
+        scheduleFogFlush()
     end
 end
 
@@ -957,6 +977,50 @@ loadFogTexture = function(forceReload)
     end
 
     return fogTexture
+end
+
+-- Fog persistence is throttled off the travel hot path. Crossing into new
+-- cells only updates the in-memory grid; the TGA write + texture refresh are
+-- coalesced (VisualThrottleMs), and the .dat save is rarer (SaveThrottleMs)
+-- plus a guaranteed flush on map change.
+scheduleFogFlush = function()
+    if fogFlushPending then return end
+    fogFlushPending = true
+    local delay = (Config.FogOfWar and Config.FogOfWar.VisualThrottleMs) or 750
+    ExecuteWithDelay(delay, function()
+        ExecuteInGameThread(flushFogVisual)
+    end)
+end
+
+flushFogVisual = function()
+    fogFlushPending = false
+    if not isFogEnabled() then return end
+    safeCall("Fog TGA write", writeFogTGA)
+    if overlay.fog and overlay.fog:IsValid() then
+        local fogTex = loadFogTexture(true)
+        if fogTex and fogTex:IsValid() then
+            setImageTexture(overlay.fog, fogTex, COLOR_WHITE)
+            overlay.fogTextureApplied = true
+        end
+    end
+    scheduleFogSave()
+end
+
+scheduleFogSave = function()
+    if fogSavePending or not fogSaveDirty then return end
+    fogSavePending = true
+    local delay = (Config.FogOfWar and Config.FogOfWar.SaveThrottleMs) or 20000
+    ExecuteWithDelay(delay, function()
+        ExecuteInGameThread(flushFogSave)
+    end)
+end
+
+flushFogSave = function()
+    fogSavePending = false
+    if fogSaveDirty then
+        safeCall("Fog state save", saveFogState)
+        fogSaveDirty = false
+    end
 end
 
 local function getPlayerLocationAndForward()
@@ -993,6 +1057,8 @@ local function sampleToMapPoint(sample, mapX, mapY, mapW, mapH, out)
 
     out.X = mapX + (u * mapW)
     out.Y = mapY + (v * mapH)
+    out.U = u
+    out.V = v
     out.ForwardX = sample.forwardX
     out.ForwardY = sample.forwardY
     return out
@@ -1107,12 +1173,47 @@ local function buildDrawState(sample)
             if Config.Map.ProjectionMode ~= "MapGenie" and Config.Map.InvertVertical ~= false then forwardY = -forwardY end
             angle = math.deg(math.atan(forwardY, forwardX))
 
+            -- Zoom + follow-cam: scroll an oversized map under a centred marker.
+            -- zoom == 1.0 collapses to the original "whole map fills the box" behaviour.
+            local zoom = largeMapOpen and largeMapZoom or minimapZoom
+            if not zoom or zoom < 1.0 then zoom = 1.0 end
+            local mapW = width * zoom
+            local mapH = height * zoom
+            local u = point.U or 0.5
+            local v = point.V or 0.5
+            -- Which map point sits at box centre. Minimap follows the player; the
+            -- large map centres on the player when opened, then pans freely
+            -- (largeMapViewU/V), decoupled from the player position.
+            local cu, cv = u, v
+            if largeMapOpen then
+                if largeMapViewU == nil then largeMapViewU = u end
+                if largeMapViewV == nil then largeMapViewV = v end
+                cu = largeMapViewU
+                cv = largeMapViewV
+            end
+            -- Offset of the map's top-left inside the box, clamped so we never
+            -- scroll past the image edges (no black gap at map borders).
+            local mapLocalX = clamp((width * 0.5) - (cu * mapW), width - mapW, 0.0)
+            local mapLocalY = clamp((height * 0.5) - (cv * mapH), height - mapH, 0.0)
+            state.mapLocalX = mapLocalX
+            state.mapLocalY = mapLocalY
+            state.mapW = mapW
+            state.mapH = mapH
+            -- Marker stays at the PLAYER position (u,v) within whatever view is
+            -- shown; drifts off-centre while panning, hidden once it leaves the box.
+            local markerX = x + (u * mapW) + mapLocalX
+            local markerY = y + (v * mapH) + mapLocalY
+            state.markerX = markerX
+            state.markerY = markerY
+            state.markerOnScreen = markerX >= x and markerX <= (x + width)
+                and markerY >= y and markerY <= (y + height)
+
             local marker = Config.Marker or {}
             local moveThreshold = marker.MoveThresholdPixels or 1
             local headingThreshold = marker.HeadingThresholdDegrees or 1
             angleKey = quantize(angle, headingThreshold)
-            state.markerXKey = quantize(point.X, moveThreshold)
-            state.markerYKey = quantize(point.Y, moveThreshold)
+            state.markerXKey = quantize(markerX, moveThreshold)
+            state.markerYKey = quantize(markerY, moveThreshold)
             state.markerAngleKey = angleKey
             state.markerSize = marker.Size or 8
         end
@@ -1213,7 +1314,7 @@ local function applyDrawState(state)
             overlay.dim:SetColorAndOpacity(COLOR_BLACK)
         end
 
-        setSlotRect(overlay.mapSlot, state.x, state.y, state.width, state.height, 990)
+        setSlotRect(overlay.viewportSlot, state.x, state.y, state.width, state.height, 990)
         setSlotRect(overlay.borderTopSlot, state.x, state.y, state.width, state.thickness, 991)
         setSlotRect(overlay.borderRightSlot, state.x + state.width - state.thickness, state.y, state.thickness, state.height, 991)
         setSlotRect(overlay.borderBottomSlot, state.x, state.y + state.height - state.thickness, state.width, state.thickness, 991)
@@ -1221,9 +1322,6 @@ local function applyDrawState(state)
     end
 
     if isFogEnabled() and overlay.fog:IsValid() then
-        if layoutChanged then
-            setSlotRect(overlay.fogSlot, state.x, state.y, state.width, state.height, 995)
-        end
         if fogDirty then
             fogDirty = false
             local fogTex = loadFogTexture(true)
@@ -1241,9 +1339,15 @@ local function applyDrawState(state)
     end
 
     local hasPoint = state.point ~= nil
-    setMarkerVisibility(hasPoint)
+    setMarkerVisibility(hasPoint and state.markerOnScreen ~= false)
     if not hasPoint then
         return
+    end
+
+    -- Scroll the map (and fog, locked to it) to follow the player.
+    setSlotRect(overlay.mapSlot, state.mapLocalX, state.mapLocalY, state.mapW, state.mapH, 0)
+    if isFogEnabled() and overlay.fog:IsValid() then
+        setSlotRect(overlay.fogSlot, state.mapLocalX, state.mapLocalY, state.mapW, state.mapH, 1)
     end
 
     local size = state.markerSize or 8
@@ -1264,7 +1368,7 @@ local function applyDrawState(state)
     if shapeChanged then
         setSlotRect(overlay.markerSlot, 0.0, 0.0, size * 2, size * 2, 1001)
     end
-    setWidgetRenderTranslation(overlay.marker, state.point.X - size, state.point.Y - size)
+    setWidgetRenderTranslation(overlay.marker, state.markerX - size, state.markerY - size)
 
     if overlay.lastHeadingAngleKey ~= state.angleKey then
         overlay.lastHeadingAngleKey = state.angleKey
@@ -1294,6 +1398,8 @@ local function resetOverlay()
     fogLastCellX = nil
     fogLastCellY = nil
     fogDirty = false
+    fogFlushPending = false
+    fogSavePending = false
     cachedPawn = CreateInvalidObject()
     pawnCheckCountdown = 0
     viewportPollCountdown = 0
@@ -1500,6 +1606,10 @@ registerConfiguredKey("OpenMap", Config.OpenMapKey, Config.OpenMapModifiers, fun
     lockKeyForDebounce(function() openToggleLocked = false end)
 
     largeMapOpen = not largeMapOpen
+    if largeMapOpen then
+        largeMapViewU = nil
+        largeMapViewV = nil
+    end
     log("Large map " .. (largeMapOpen and "opened" or "closed"))
     markOverlayStateDirty(true)
     scheduleMapWork(0, true)
@@ -1525,6 +1635,64 @@ registerConfiguredKey("HideMap", Config.HideMapKey, Config.HideMapModifiers, fun
     scheduleMapWork(0, true)
 end)
 
+local function adjustZoom(zoomIn)
+    local layout = largeMapOpen and Config.LargeMap or (mapVisible and Config.Minimap or nil)
+    if not layout then return end
+    local step = layout.ZoomStep or 0.5
+    local delta = zoomIn and step or -step
+    local zmin = layout.ZoomMin or 1.0
+    local zmax = layout.ZoomMax or (largeMapOpen and 6.0 or 8.0)
+    if largeMapOpen then
+        largeMapZoom = clamp(largeMapZoom + delta, zmin, zmax)
+        log(string.format("Large map zoom: %.2f", largeMapZoom))
+    else
+        minimapZoom = clamp(minimapZoom + delta, zmin, zmax)
+        log(string.format("Minimap zoom: %.2f", minimapZoom))
+    end
+    markOverlayStateDirty(true)
+    scheduleMapWork(0, true)
+end
+
+registerConfiguredKey("ZoomIn", Config.ZoomInKey, Config.ZoomInModifiers, function()
+    adjustZoom(true)
+end)
+
+registerConfiguredKey("ZoomOut", Config.ZoomOutKey, Config.ZoomOutModifiers, function()
+    adjustZoom(false)
+end)
+
+-- Large-map panning (arrow keys by default). Active only while the large map is
+-- open AND zoomed past 1.0 (at 1.0 the whole map is visible, nothing to pan to).
+local function adjustPan(du, dv)
+    if not largeMapOpen then return end
+    if largeMapViewU == nil or largeMapViewV == nil then return end
+    local zoom = largeMapZoom
+    if not zoom or zoom < 1.0 then zoom = 1.0 end
+    -- PanStep is a fraction of the *visible* view, so a press moves the same
+    -- on-screen distance at any zoom (divide by zoom to get map-UV units).
+    local step = ((Config.LargeMap and Config.LargeMap.PanStep) or 0.25) / zoom
+    largeMapViewU = clamp(largeMapViewU + du * step, 0.0, 1.0)
+    largeMapViewV = clamp(largeMapViewV + dv * step, 0.0, 1.0)
+    markOverlayStateDirty(true)
+    scheduleMapWork(0, true)
+end
+
+registerConfiguredKey("PanUp", Config.PanUpKey, Config.PanUpModifiers, function()
+    adjustPan(0, -1)
+end)
+
+registerConfiguredKey("PanDown", Config.PanDownKey, Config.PanDownModifiers, function()
+    adjustPan(0, 1)
+end)
+
+registerConfiguredKey("PanLeft", Config.PanLeftKey, Config.PanLeftModifiers, function()
+    adjustPan(-1, 0)
+end)
+
+registerConfiguredKey("PanRight", Config.PanRightKey, Config.PanRightModifiers, function()
+    adjustPan(1, 0)
+end)
+
 safeCall("Register ClientRestart hook", function()
     RegisterHook("/Script/Engine.PlayerController:ClientRestart", function()
         scheduleMapWork(Config.AttachInitialDelayMs or 250, true)
@@ -1532,6 +1700,10 @@ safeCall("Register ClientRestart hook", function()
 end)
 
 RegisterLoadMapPostHook(function()
+    if fogSaveDirty then
+        safeCall("Fog save on map change", saveFogState)
+        fogSaveDirty = false
+    end
     stopUpdateLoop()
     cancelAttachAttempt()
     resetOverlay()

@@ -9,6 +9,24 @@ local Config = {
     -- Modifier keys for the hide map key
     HideMapModifiers = {},
 
+    -- Zoom in / out keys. They affect whichever map is currently shown
+    -- (minimap or the large map). Key names: see the UE4SS Key table linked above.
+    ZoomInKey = "ADD",          -- numpad +
+    ZoomInModifiers = {},
+    ZoomOutKey = "SUBTRACT",     -- numpad -
+    ZoomOutModifiers = {},
+
+    -- Large-map pan keys (arrow keys). Active only while the large map is open
+    -- and zoomed past 1.0. Key names: see the UE4SS Key table linked above.
+    PanUpKey = "UP_ARROW",
+    PanUpModifiers = {},
+    PanDownKey = "DOWN_ARROW",
+    PanDownModifiers = {},
+    PanLeftKey = "LEFT_ARROW",
+    PanLeftModifiers = {},
+    PanRightKey = "RIGHT_ARROW",
+    PanRightModifiers = {},
+
     -- If true, the minimap is visible when the game starts
     ShowMinimapAtStartup = true,
     -- Default map refresh interval (milliseconds)
@@ -23,9 +41,11 @@ local Config = {
     KeyDebounceMs = 600,
 
     Map = {
-        ImageFile = "mapgenie_world_cropped.png.lua",
-        ImageWidth = 1144,
-        ImageHeight = 482,
+        ImageFile = "mapgenie_SN2_world_HIRES.png.lua",
+        -- DO NOT CHANGE! THIS IS THE RESOLUTION OF THE IMAGE ITSELF
+        ImageWidth = 9145,
+        -- DO NOT CHANGE! THIS IS THE RESOLUTION OF THE IMAGE ITSELF
+        ImageHeight = 3845,
         ProjectionMode = "MapGenie",
         LngFromXScale = 0.0000028912681189998626,
         LngFromXOffset = -0.049961343800042045,
@@ -59,6 +79,12 @@ local Config = {
         Anchor = "TopRight",
         -- Fixed minimap width in pixels (height adapts to the image aspect ratio)
         Width = 360,
+        -- Zoom factor: 1.0 = whole map fits the box; higher = magnified + follows you.
+        Zoom = 3.0,
+        ZoomMin = 1.0,
+        ZoomMax = 12.0,
+        -- Amount added (zoom in) / removed (zoom out) per keypress. Use 1, 0.5, 0.25, etc.
+        ZoomStep = 0.5,
         -- Margin from the top of the screen (pixels)
         MarginTop = 24,
         -- Margin from the right of the screen (pixels)
@@ -80,6 +106,15 @@ local Config = {
         WidthRatio = 0.90,
         -- Large map height as a fraction of the screen (0.72 = 72%)
         HeightRatio = 0.72,
+        -- Zoom factor: 1.0 = whole map fits the box; higher = magnified + follows you.
+        Zoom = 1.0,
+        ZoomMin = 1.0,
+        ZoomMax = 8.0,
+        -- Amount added (zoom in) / removed (zoom out) per keypress. Use 1, 0.5, 0.25, etc.
+        ZoomStep = 0.5,
+        -- Pan distance per arrow press, as a fraction of the visible view
+        -- (only applies once zoomed past 1.0). Arrow keys by default.
+        PanStep = 0.25,
         -- Opacity of the dark background behind the large map
         BackgroundAlpha = 0.88,
         -- Opacity of the map image
@@ -118,6 +153,13 @@ local Config = {
         SaveFile = "fog_state.dat",
         -- Opacity of unrevealed fog (0.0 = invisible, 1.0 = fully opaque)
         FogAlpha = 0.95,
+        -- Throttle for the on-screen fog refresh (ms): newly-revealed cells are
+        -- batched and redrawn at most this often, keeping disk + texture work
+        -- off the travel hot path. Fog may appear up to this late (unnoticeable).
+        VisualThrottleMs = 750,
+        -- Throttle for writing fog progress to disk (ms). Also force-saved on map
+        -- change. Worst-case loss on a hard crash = reveals within this window.
+        SaveThrottleMs = 20000,
     },
 
     Debug = {
