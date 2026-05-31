@@ -1653,14 +1653,6 @@ local function adjustZoom(zoomIn)
     scheduleMapWork(0, true)
 end
 
-registerConfiguredKey("ZoomIn", Config.ZoomInKey, Config.ZoomInModifiers, function()
-    adjustZoom(true)
-end)
-
-registerConfiguredKey("ZoomOut", Config.ZoomOutKey, Config.ZoomOutModifiers, function()
-    adjustZoom(false)
-end)
-
 -- Large-map panning (arrow keys by default). Active only while the large map is
 -- open AND zoomed past 1.0 (at 1.0 the whole map is visible, nothing to pan to).
 local function adjustPan(du, dv)
@@ -1677,20 +1669,360 @@ local function adjustPan(du, dv)
     scheduleMapWork(0, true)
 end
 
-registerConfiguredKey("PanUp", Config.PanUpKey, Config.PanUpModifiers, function()
-    adjustPan(0, -1)
-end)
+-- =====================================================================
+-- SN2ModSettings integration (optional dependency, Nexus mod #20).
+-- Registers settings under Settings > Mods in-game. If the framework is not
+-- installed the manifest file just sits unused and the mod runs normally.
+-- config.lua stays the source of DEFAULTS; once a value is changed in-menu
+-- SN2ModSettings persists it and that overrides the default on later launches.
+-- =====================================================================
+local SN2MS_NAME    = "SubnauticaMapMod"
+local SN2MS_DISPLAY = "Simple Minimap"
+local SN2MS_VERSION = "18"            -- header text only; edit to match yours
+local SN2MS_NEXUS   = "116"
+local SN2MS_MANIFEST = "./ue4ss/Mods/SN2ModSettings/registrations/" .. SN2MS_NAME .. ".lua"
 
-registerConfiguredKey("PanDown", Config.PanDownKey, Config.PanDownModifiers, function()
-    adjustPan(0, 1)
-end)
+local function sn2msClampInt(v, lo, hi)
+    v = math.floor((tonumber(v) or lo) + 0.5)
+    if v < lo then v = lo elseif v > hi then v = hi end
+    return v
+end
+local function sn2msClampNum(v, lo, hi)
+    v = tonumber(v); if not v then return nil end
+    if lo and v < lo then v = lo end
+    if hi and v > hi then v = hi end
+    return math.floor(v * 10000 + 0.5) / 10000   -- stabilise float compares
+end
+local function sn2msRelayout()
+    markOverlayStateDirty(true)
+    scheduleMapWork(0, true)
+end
+local function sn2msRebuild()
+    resetOverlay()
+    scheduleMapWork(Config.AttachInitialDelayMs or 250, true)
+end
 
-registerConfiguredKey("PanLeft", Config.PanLeftKey, Config.PanLeftModifiers, function()
-    adjustPan(-1, 0)
-end)
+-- Named marker colours (rotator). RGB in 0..1; alpha forced to 1.
+local SN2MS_MARKER_COLORS = {
+    Cyan    = { R = 0.0, G = 0.9, B = 1.0 },
+    White   = { R = 1.0, G = 1.0, B = 1.0 },
+    Red     = { R = 1.0, G = 0.2, B = 0.2 },
+    Green   = { R = 0.2, G = 1.0, B = 0.3 },
+    Yellow  = { R = 1.0, G = 0.9, B = 0.2 },
+    Orange  = { R = 1.0, G = 0.6, B = 0.1 },
+    Blue    = { R = 0.2, G = 0.4, B = 1.0 },
+    Magenta = { R = 1.0, G = 0.2, B = 0.8 },
+}
+local SN2MS_MARKER_ORDER = { "Cyan", "White", "Red", "Green", "Yellow", "Orange", "Blue", "Magenta" }
+local SN2MS_ANCHORS = { "TopRight", "TopLeft", "BottomRight", "BottomLeft", "Center" }
 
-registerConfiguredKey("PanRight", Config.PanRightKey, Config.PanRightModifiers, function()
-    adjustPan(1, 0)
+local function sn2msNearestColorName()
+    local c = (Config.Marker or {}).Color or {}
+    local best, bestD = "Cyan", math.huge
+    for _, name in ipairs(SN2MS_MARKER_ORDER) do
+        local rgb = SN2MS_MARKER_COLORS[name]
+        local d = math.abs((c.R or 0) - rgb.R) + math.abs((c.G or 0) - rgb.G) + math.abs((c.B or 0) - rgb.B)
+        if d < bestD then bestD, best = d, name end
+    end
+    return best
+end
+
+local function sn2msContains(list, v)
+    for _, x in ipairs(list) do if x == v then return true end end
+    return false
+end
+
+local mini  = Config.Minimap or {}
+local large = Config.LargeMap or {}
+local mk    = Config.Marker or {}
+
+-- type: "toggle" | "slider" (format integer/float/percent) | "rotator" (options)
+local sn2msSettings = {
+    -- Toggles
+    { key="ShowMinimap", title="Show minimap", type="toggle",
+      description="Show the minimap overlay during play.",
+      default=(Config.ShowMinimapAtStartup ~= false),
+      apply=function(v) mapVisible = v and true or false; sn2msRelayout() end },
+    { key="FogEnabled", title="Fog of war", type="toggle",
+      description="Hide unexplored areas until you travel near them.",
+      default=(Config.FogOfWar and Config.FogOfWar.Enabled ~= false),
+      apply=function(v) if Config.FogOfWar then Config.FogOfWar.Enabled = v and true or false end; sn2msRebuild() end },
+    { key="LargeMapDim", title="Large map dims screen", type="toggle",
+      description="Darken the rest of the screen while the large map is open.",
+      default=(large.DimBackground ~= false),
+      apply=function(v) if Config.LargeMap then Config.LargeMap.DimBackground = v and true or false end; sn2msRelayout() end },
+
+    -- Integer sliders
+    { key="MinimapWidth", title="Minimap width (px)", type="slider", format="integer",
+      description="Width of the minimap in pixels; height follows the map aspect ratio.",
+      default=sn2msClampInt(mini.Width or 360, 150, 900), min=150, max=900, step=10,
+      apply=function(v) if Config.Minimap then Config.Minimap.Width = v end; sn2msRelayout() end },
+    { key="MinimapMarginTop", title="Minimap margin top (px)", type="slider", format="integer",
+      description="Gap between the minimap and the top edge of the screen.",
+      default=sn2msClampInt(mini.MarginTop or 24, 0, 200), min=0, max=200, step=1,
+      apply=function(v) if Config.Minimap then Config.Minimap.MarginTop = v end; sn2msRelayout() end },
+    { key="MinimapMarginRight", title="Minimap margin right (px)", type="slider", format="integer",
+      description="Gap between the minimap and the side edge of the screen.",
+      default=sn2msClampInt(mini.MarginRight or 24, 0, 200), min=0, max=200, step=1,
+      apply=function(v) if Config.Minimap then Config.Minimap.MarginRight = v end; sn2msRelayout() end },
+    { key="MinimapBorder", title="Minimap border (px)", type="slider", format="integer",
+      description="Thickness of the border drawn around the minimap.",
+      default=sn2msClampInt(mini.BorderThickness or 2, 0, 10), min=0, max=10, step=1,
+      apply=function(v) if Config.Minimap then Config.Minimap.BorderThickness = v end; sn2msRelayout() end },
+    { key="LargeMapBorder", title="Large map border (px)", type="slider", format="integer",
+      description="Thickness of the border drawn around the large map.",
+      default=sn2msClampInt(large.BorderThickness or 3, 0, 10), min=0, max=10, step=1,
+      apply=function(v) if Config.LargeMap then Config.LargeMap.BorderThickness = v end; sn2msRelayout() end },
+    { key="MarkerSize", title="Player marker size (px)", type="slider", format="integer",
+      description="Size of the player arrow marker in pixels.",
+      default=sn2msClampInt(mk.Size or 12, 4, 32), min=4, max=32, step=1,
+      apply=function(v) if Config.Marker then Config.Marker.Size = v end; sn2msRelayout() end },
+    { key="MinimapMaxZoom", title="Minimap max zoom", type="slider", format="integer",
+      description="Highest zoom level the minimap can reach with the zoom keys.",
+      default=sn2msClampInt(mini.ZoomMax or 12, 2, 20), min=2, max=20, step=1,
+      apply=function(v) if Config.Minimap then Config.Minimap.ZoomMax = v end; if minimapZoom > v then minimapZoom = v end; sn2msRelayout() end },
+    { key="LargeMapMaxZoom", title="Large map max zoom", type="slider", format="integer",
+      description="Highest zoom level the large map can reach with the zoom keys.",
+      default=sn2msClampInt(large.ZoomMax or 8, 2, 20), min=2, max=20, step=1,
+      apply=function(v) if Config.LargeMap then Config.LargeMap.ZoomMax = v end; if largeMapZoom > v then largeMapZoom = v end; sn2msRelayout() end },
+    { key="MinimapUpdateMs", title="Minimap update interval (ms)", type="slider", format="integer",
+      description="How often the minimap redraws. Lower = smoother scrolling, slightly more work.",
+      default=sn2msClampInt(mini.UpdateIntervalMs or 500, 50, 2000), min=50, max=2000, step=10,
+      apply=function(v) if Config.Minimap then Config.Minimap.UpdateIntervalMs = v end end },
+    { key="LargeMapUpdateMs", title="Large map update interval (ms)", type="slider", format="integer",
+      description="How often the large map redraws while open.",
+      default=sn2msClampInt(large.UpdateIntervalMs or 200, 50, 2000), min=50, max=2000, step=10,
+      apply=function(v) if Config.LargeMap then Config.LargeMap.UpdateIntervalMs = v end end },
+
+    -- Float sliders
+    { key="MinimapZoomStep", title="Minimap zoom step", type="slider", format="float",
+      description="Amount the minimap zoom changes per key press.",
+      default=(mini.ZoomStep or 0.5), min=0.1, max=2.0, step=0.1,
+      apply=function(v) if Config.Minimap then Config.Minimap.ZoomStep = v end end },
+    { key="LargeMapZoomStep", title="Large map zoom step", type="slider", format="float",
+      description="Amount the large map zoom changes per key press.",
+      default=(large.ZoomStep or 0.5), min=0.1, max=2.0, step=0.1,
+      apply=function(v) if Config.LargeMap then Config.LargeMap.ZoomStep = v end end },
+    { key="LargeMapPanStep", title="Large map pan step", type="slider", format="float",
+      description="Distance the large map pans per arrow press, as a fraction of the view.",
+      default=(large.PanStep or 0.25), min=0.1, max=2.0, step=0.1,
+      apply=function(v) if Config.LargeMap then Config.LargeMap.PanStep = v end end },
+
+    -- Percent sliders (stored as 0..1, shown as %)
+    { key="MinimapOpacity", title="Minimap opacity (%)", type="slider", format="percent",
+      description="Opacity of the minimap image.",
+      default=(mini.MapAlpha or 0.92), min=0.0, max=1.0, step=0.01,
+      apply=function(v) if Config.Minimap then Config.Minimap.MapAlpha = v end; sn2msRelayout() end },
+    { key="MinimapBackground", title="Minimap background opacity (%)", type="slider", format="percent",
+      description="Opacity of the dark backdrop behind the minimap.",
+      default=(mini.BackgroundAlpha or 0.55), min=0.0, max=1.0, step=0.01,
+      apply=function(v) if Config.Minimap then Config.Minimap.BackgroundAlpha = v end; sn2msRelayout() end },
+    { key="LargeMapBackground", title="Large map background opacity (%)", type="slider", format="percent",
+      description="Opacity of the dark backdrop behind the large map.",
+      default=(large.BackgroundAlpha or 0.88), min=0.0, max=1.0, step=0.01,
+      apply=function(v) if Config.LargeMap then Config.LargeMap.BackgroundAlpha = v end; sn2msRelayout() end },
+
+    -- Rotators (value is one of the option strings)
+    { key="MinimapAnchor", title="Minimap position", type="rotator", options=SN2MS_ANCHORS,
+      description="Which screen corner the minimap is anchored to.",
+      default=(mini.Anchor or "TopRight"),
+      apply=function(v) if Config.Minimap then Config.Minimap.Anchor = v end; sn2msRelayout() end },
+    { key="LargeMapAnchor", title="Large map position", type="rotator", options=SN2MS_ANCHORS,
+      description="Where the large map is anchored on screen.",
+      default=(large.Anchor or "Center"),
+      apply=function(v) if Config.LargeMap then Config.LargeMap.Anchor = v end; sn2msRelayout() end },
+    { key="MarkerColor", title="Player marker colour", type="rotator", options=SN2MS_MARKER_ORDER,
+      description="Colour of the player arrow marker.",
+      default=sn2msNearestColorName(),
+      apply=function(v)
+          local rgb = SN2MS_MARKER_COLORS[v]
+          if not rgb then return end
+          if Config.Marker then Config.Marker.Color = { R = rgb.R, G = rgb.G, B = rgb.B, A = 1.0 } end
+          COLOR_MARKER = color((Config.Marker or {}).Color, 1.0)
+          sn2msRebuild()
+      end },
+
+    -- Keybinds (handled by the dispatcher below, not the poll). Defaults are the
+    -- Unreal FKey names SN2ModSettings captures ("Add" = numpad +, etc.).
+    { key="ZoomIn",   title="Zoom in key",   type="keybind", default="Add",
+      description="Key to zoom the active map in." },
+    { key="ZoomOut",  title="Zoom out key",  type="keybind", default="Subtract",
+      description="Key to zoom the active map out." },
+    { key="PanUp",    title="Pan up key",    type="keybind", default="Up",
+      description="Pan the large map up (only while zoomed in)." },
+    { key="PanDown",  title="Pan down key",  type="keybind", default="Down",
+      description="Pan the large map down (only while zoomed in)." },
+    { key="PanLeft",  title="Pan left key",  type="keybind", default="Left",
+      description="Pan the large map left (only while zoomed in)." },
+    { key="PanRight", title="Pan right key", type="keybind", default="Right",
+      description="Pan the large map right (only while zoomed in)." },
+}
+
+local function sn2msNum(n) return string.format("%g", n) end
+local function sn2msNumF(n)
+    local s = tostring(n)
+    if not s:find("[%.eE]") then s = s .. ".0" end
+    return s
+end
+
+local function sn2msWriteManifest()
+    local dir = SN2MS_MANIFEST:match("(.*[/\\])")
+    if dir then os.execute('mkdir "' .. dir:gsub("/", "\\") .. '" 2>nul') end
+    local f = io.open(SN2MS_MANIFEST, "w")
+    if not f then
+        log("SN2ModSettings: could not write manifest at %s", SN2MS_MANIFEST)
+        return
+    end
+    local p = {}
+    p[#p+1] = "-- Auto-generated each launch by SubnauticaMapMod, synced from config.lua."
+    p[#p+1] = "return {"
+    p[#p+1] = string.format("    name     = %q,", SN2MS_NAME)
+    p[#p+1] = string.format("    display  = %q,", SN2MS_DISPLAY)
+    if SN2MS_VERSION then p[#p+1] = string.format("    version  = %q,", SN2MS_VERSION) end
+    if SN2MS_NEXUS then p[#p+1] = string.format("    nexus_id = %q,", SN2MS_NEXUS) end
+    p[#p+1] = "    settings = {"
+    for _, s in ipairs(sn2msSettings) do
+        p[#p+1] = "        {"
+        p[#p+1] = string.format("            key         = %q,", s.key)
+        p[#p+1] = string.format("            title       = %q,", s.title)
+        p[#p+1] = string.format("            description = %q,", s.description)
+        p[#p+1] = string.format("            type        = %q,", s.type)
+        if s.type == "toggle" then
+            p[#p+1] = string.format("            default     = %s,", s.default and "true" or "false")
+        elseif s.type == "keybind" then
+            p[#p+1] = string.format("            default     = %q,", s.default)
+        elseif s.type == "rotator" then
+            local opts = {}
+            for _, o in ipairs(s.options) do opts[#opts+1] = string.format("%q", o) end
+            p[#p+1] = "            options     = { " .. table.concat(opts, ", ") .. " },"
+            p[#p+1] = string.format("            default     = %q,", s.default)
+        else
+            local isInt = (s.format == "integer")
+            local function num(x) return isInt and string.format("%d", x) or sn2msNumF(x) end
+            p[#p+1] = string.format("            default     = %s,", num(s.default))
+            if s.min then p[#p+1] = string.format("            min         = %s,", num(s.min)) end
+            if s.max then p[#p+1] = string.format("            max         = %s,", num(s.max)) end
+            if s.step then p[#p+1] = string.format("            step        = %s,", num(s.step)) end
+            if s.format then p[#p+1] = string.format("            format      = %q,", s.format) end
+        end
+        p[#p+1] = "        },"
+    end
+    p[#p+1] = "    },"
+    p[#p+1] = "}"
+    p[#p+1] = ""
+    f:write(table.concat(p, "\n"))
+    f:close()
+    log("SN2ModSettings: manifest written (%d settings)", #sn2msSettings)
+end
+
+local sn2msLastApplied = {}
+for _, s in ipairs(sn2msSettings) do sn2msLastApplied[s.key] = s.default end
+
+local function sn2msPoll()
+    if not ModRef then return end
+    for _, s in ipairs(sn2msSettings) do
+        if s.type ~= "keybind" then   -- keybinds are handled by the dispatcher
+        local ok, raw = pcall(function()
+            return ModRef:GetSharedVariable("SN2ModSettings/" .. SN2MS_NAME .. "/" .. s.key)
+        end)
+        if ok and raw ~= nil then
+            local value
+            if s.type == "toggle" then
+                if type(raw) == "boolean" then value = raw
+                elseif type(raw) == "number" then value = raw ~= 0
+                elseif type(raw) == "string" then value = (raw == "true" or raw == "1") end
+            elseif s.type == "rotator" then
+                if type(raw) == "string" and sn2msContains(s.options, raw) then value = raw end
+            else
+                local n = (type(raw) == "number") and raw or tonumber(raw)
+                if n then
+                    if s.format == "integer" then value = sn2msClampInt(n, s.min or 0, s.max or n)
+                    else value = sn2msClampNum(n, s.min, s.max) end
+                end
+            end
+            if value ~= nil and value ~= sn2msLastApplied[s.key] then
+                sn2msLastApplied[s.key] = value
+                local applyFn, key = s.apply, s.key
+                ExecuteInGameThread(function()
+                    local aok, err = pcall(applyFn, value)
+                    if not aok then log("SN2ModSettings apply '%s' failed: %s", key, tostring(err)) end
+                end)
+            end
+        end
+        end
+    end
+end
+
+-- Live keybind dispatch (SN2ModSettings "dispatcher pattern"). UE4SS can't
+-- rebind at runtime, so we register every candidate key once; each press checks
+-- which action it's currently bound to. Bindings come from SN2ModSettings
+-- (primary at <key>, alternative at <key>_Alt), cached and refreshed each tick,
+-- falling back to defaults so zoom/pan also work without the framework.
+local sn2msKeyDefaults = {
+    ZoomIn = "Add", ZoomOut = "Subtract",
+    PanUp = "Up", PanDown = "Down", PanLeft = "Left", PanRight = "Right",
+}
+local sn2msKeyActions = {
+    { key = "ZoomIn",   run = function() adjustZoom(true) end },
+    { key = "ZoomOut",  run = function() adjustZoom(false) end },
+    { key = "PanUp",    run = function() adjustPan(0, -1) end },
+    { key = "PanDown",  run = function() adjustPan(0, 1) end },
+    { key = "PanLeft",  run = function() adjustPan(-1, 0) end },
+    { key = "PanRight", run = function() adjustPan(1, 0) end },
+}
+local sn2msBindCache = {}
+for k, v in pairs(sn2msKeyDefaults) do sn2msBindCache[k] = { pri = v, alt = "" } end
+
+local function sn2msRefreshBindings()
+    if not ModRef then return end
+    for _, act in ipairs(sn2msKeyActions) do
+        local key = act.key
+        local pri, alt = sn2msKeyDefaults[key], ""
+        local ok, p = pcall(function() return ModRef:GetSharedVariable("SN2ModSettings/" .. SN2MS_NAME .. "/" .. key) end)
+        if ok and type(p) == "string" and p ~= "" then pri = p end
+        local ok2, a = pcall(function() return ModRef:GetSharedVariable("SN2ModSettings/" .. SN2MS_NAME .. "/" .. key .. "_Alt") end)
+        if ok2 and type(a) == "string" then alt = a end
+        sn2msBindCache[key] = { pri = pri, alt = alt }
+    end
+end
+
+local function sn2msDispatchKey(capturedName)
+    for _, act in ipairs(sn2msKeyActions) do
+        local b = sn2msBindCache[act.key]
+        if b and (capturedName == b.pri or (b.alt ~= "" and capturedName == b.alt)) then
+            act.run()
+        end
+    end
+end
+
+-- FKey name (menu capture) -> UE4SS Key constant (registration). Missing keys skipped.
+if Key then
+    local keyMap = {}
+    local function addKey(name, k) if k ~= nil then keyMap[name] = k end end
+    local letters = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    for i = 1, #letters do local c = letters:sub(i, i); addKey(c, Key[c]) end
+    for i = 1, 12 do addKey("F" .. i, Key["F" .. i]) end
+    addKey("Add", Key.ADD); addKey("Subtract", Key.SUBTRACT)
+    addKey("Multiply", Key.MULTIPLY); addKey("Divide", Key.DIVIDE)
+    addKey("Up", Key.UP_ARROW); addKey("Down", Key.DOWN_ARROW)
+    addKey("Left", Key.LEFT_ARROW); addKey("Right", Key.RIGHT_ARROW)
+    addKey("PageUp", Key.PAGE_UP); addKey("PageDown", Key.PAGE_DOWN)
+    addKey("Home", Key.HOME); addKey("End", Key.END)
+    for fkeyName, keyConst in pairs(keyMap) do
+        local captured = fkeyName
+        safeCall("SN2ModSettings keybind " .. fkeyName, function()
+            RegisterKeyBind(keyConst, function()
+                ExecuteInGameThread(function() sn2msDispatchKey(captured) end)
+            end)
+        end)
+    end
+end
+
+safeCall("SN2ModSettings manifest", sn2msWriteManifest)
+sn2msRefreshBindings()
+LoopAsync(1000, function()
+    sn2msPoll()
+    sn2msRefreshBindings()
 end)
 
 safeCall("Register ClientRestart hook", function()

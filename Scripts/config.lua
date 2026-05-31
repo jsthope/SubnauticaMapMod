@@ -9,24 +9,6 @@ local Config = {
     -- Modifier keys for the hide map key
     HideMapModifiers = {},
 
-    -- Zoom in / out keys. They affect whichever map is currently shown
-    -- (minimap or the large map). Key names: see the UE4SS Key table linked above.
-    ZoomInKey = "ADD",          -- numpad +
-    ZoomInModifiers = {},
-    ZoomOutKey = "SUBTRACT",     -- numpad -
-    ZoomOutModifiers = {},
-
-    -- Large-map pan keys (arrow keys). Active only while the large map is open
-    -- and zoomed past 1.0. Key names: see the UE4SS Key table linked above.
-    PanUpKey = "UP_ARROW",
-    PanUpModifiers = {},
-    PanDownKey = "DOWN_ARROW",
-    PanDownModifiers = {},
-    PanLeftKey = "LEFT_ARROW",
-    PanLeftModifiers = {},
-    PanRightKey = "RIGHT_ARROW",
-    PanRightModifiers = {},
-
     -- If true, the minimap is visible when the game starts
     ShowMinimapAtStartup = true,
     -- Default map refresh interval (milliseconds)
